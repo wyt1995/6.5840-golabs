@@ -164,7 +164,7 @@ func doReduceTask(reducef func(string, []string) string, reply *WorkerReply) {
 	ofile.Close()
 
 	// send a finish message to the coordinator
-	args := WorkerArgs{reply.ReduceTaskNumber, 0}
+	args := WorkerArgs{0, reply.ReduceTaskNumber}
 	call("Coordinator.ReduceTaskFinish", &args, &WorkerReply{})
 }
 
