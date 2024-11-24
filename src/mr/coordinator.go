@@ -25,13 +25,14 @@ type Coordinator struct {
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) ScheduleTask(args *WorkerArgs, reply *WorkerReply) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.nMapDone < c.nMap {
 		c.scheduleMapTask(reply)
 	} else if c.nReduceDone < c.nReduce {
 		c.scheduleReduceTask(reply)
 	} else {
 		reply.Type = Complete
-		c.mu.Unlock()
 	}
 	return nil
 }
@@ -47,7 +48,6 @@ func (c *Coordinator) scheduleMapTask(reply *WorkerReply) {
 
 	if task == -1 {
 		reply.Type = Wait
-		c.mu.Unlock()
 	} else {
 		reply.Type = MapTask
 		reply.NMap = c.nMap
@@ -55,7 +55,6 @@ func (c *Coordinator) scheduleMapTask(reply *WorkerReply) {
 		reply.FileName = c.files[task]
 		reply.MapTaskNumber = task
 		c.mapStatus[task] = 1
-		c.mu.Unlock()
 
 		// start goroutine to monitor task status
 		go func(num int) {
@@ -82,14 +81,12 @@ func (c *Coordinator) scheduleReduceTask(reply *WorkerReply) {
 
 	if task == -1 {
 		reply.Type = Wait
-		c.mu.Unlock()
 	} else {
 		reply.Type = ReduceTask
 		reply.NMap = c.nMap
 		reply.NReduce = c.nReduce
 		reply.ReduceTaskNumber = task
 		c.reduceStatus[task] = 1
-		c.mu.Unlock()
 
 		go func(num int) {
 			time.Sleep(10 * time.Second)
@@ -159,8 +156,7 @@ func (c *Coordinator) server() {
 //
 func (c *Coordinator) Done() bool {
 	// Your code here.
-	ret := c.nReduce == c.nReduceDone
-	return ret
+	return c.nReduce == c.nReduceDone
 }
 
 //
