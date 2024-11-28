@@ -14,11 +14,17 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type Recent struct {
+	request int
+	value   string
+}
 
 type KVServer struct {
 	mu    sync.Mutex
 	kvmap map[string]string
-	// Your definitions here.
+	cache map[int64]Recent
+	// cache the most recent request from each client to handle duplicate
+	// assume that a client will make only one call to a Clerk at a time
 }
 
 
@@ -26,6 +32,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	// duplicate detection
+	if recent, exists := kv.cache[args.Client]; exists {
+		if recent.request == args.Request {
+			reply.Value = recent.value
+			return
+		}
+	}
 
 	value, ok := kv.kvmap[args.Key]
 	if !ok {
@@ -40,13 +54,27 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	if recent, exists := kv.cache[args.Client]; exists {
+		if recent.request == args.Request {
+			return
+		}
+	}
+
 	kv.kvmap[args.Key] = args.Value
+	kv.cache[args.Client] = Recent{args.Request, ""}
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if recent, exists := kv.cache[args.Client]; exists {
+		if recent.request == args.Request {
+			reply.Value = recent.value
+			return
+		}
+	}
 
 	oldValue, ok := kv.kvmap[args.Key]
 	if !ok {
@@ -55,6 +83,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.kvmap[args.Key] = oldValue + args.Value
 	}
 	reply.Value = oldValue
+	kv.cache[args.Client] = Recent{args.Request, oldValue}
 }
 
 func StartKVServer() *KVServer {
@@ -62,6 +91,7 @@ func StartKVServer() *KVServer {
 
 	// You may need initialization code here.
 	kv.kvmap = make(map[string]string)
+	kv.cache = make(map[int64]Recent)
 
 	return kv
 }

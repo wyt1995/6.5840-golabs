@@ -8,11 +8,12 @@ import "math/big"
 type Clerk struct {
 	server *labrpc.ClientEnd
 	client int64
+	seqnum int
 }
 
 func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
+	maximum := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, maximum)
 	x := bigx.Int64()
 	return x
 }
@@ -21,6 +22,7 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
 	ck.client = nrand()
+	ck.seqnum = 0
 	return ck
 }
 
@@ -35,13 +37,14 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{key}
+	ck.seqnum++
+	args := GetArgs{key, ck.client, ck.seqnum}
 	reply := GetReply{}
-	ok := ck.server.Call("KVServer.Get", &args, &reply)
-	if ok {
-		return reply.Value
+	ok := false
+	for !ok {
+		ok = ck.server.Call("KVServer.Get", &args, &reply)
 	}
-	return ""
+	return reply.Value
 }
 
 // shared by Put and Append.
@@ -54,13 +57,14 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
-	args := PutAppendArgs{key, value, 0}
+	ck.seqnum++
+	args := PutAppendArgs{key, value, ck.client, ck.seqnum}
 	reply := PutAppendReply{}
-	ok := ck.server.Call("KVServer."+op, &args, &reply)
-	if ok {
-		return reply.Value
+	ok := false
+	for !ok {
+		ok = ck.server.Call("KVServer."+op, &args, &reply)
 	}
-	return ""
+	return reply.Value
 }
 
 func (ck *Clerk) Put(key string, value string) {
