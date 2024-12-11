@@ -83,6 +83,8 @@ type Raft struct {
 	// other volatile state
 	state         ServerState
 	lastHeartbeat time.Time
+	cond          *sync.Cond
+	applyCh       chan ApplyMsg
 }
 
 type ServerState int
@@ -92,7 +94,7 @@ const (
 	Candidate
 )
 
-const heartbeat = 100
+const heartbeat = 150
 const electionTimeout = 500
 
 // return currentTerm and whether this server
@@ -231,6 +233,15 @@ func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// Reset election timer when receive RPC from the current viable leader
 	rf.lastHeartbeat = time.Now()
 
 	// If any RPC contains Term T > currentTerm: set currentTerm = T, convert to follower
@@ -239,13 +250,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = Follower
 		rf.votedFor = -1
 	}
-
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+
+	// If log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm, reply false
+	if args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		reply.Success = false
 		return
 	}
+
+	// If an existing entry conflicts with a new one (same index but different terms),
+	// delete the existing entry and all that follow it
+	i, j := 0, args.PrevLogIndex + 1
+	for i < len(args.Entries) && j < len(rf.log) {
+		if args.Entries[i].Term == rf.log[j].Term {
+			i++
+			j++
+		} else {
+			rf.log = rf.log[:j]
+			break
+		}
+	}
+	// Append any new entries not already in the log
+	if i < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[i:]...)
+	}
 	reply.Success = true
+
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -299,12 +333,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
 
 	// Your code here (3B).
-
+	if !rf.killed() && isLeader {
+		rf.log = append(rf.log, LogEntry{Term: term, Command: command})
+	}
 
 	return index, term, isLeader
 }
@@ -402,8 +441,8 @@ func (rf *Raft) leaderHeartbeat() {
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
-			PrevLogIndex: 0,
-			PrevLogTerm:  0,
+			PrevLogIndex: len(rf.log) - 1,
+			PrevLogTerm:  rf.log[len(rf.log)-1].Term,
 			Entries:      make([]LogEntry, 0),
 			LeaderCommit: rf.commitIndex,
 		}
