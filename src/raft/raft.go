@@ -279,6 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
+		rf.cond.Broadcast()
 	}
 }
 
@@ -385,6 +386,8 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// If a follower receives no communication over an election timeout period,
+// then it assumes there is no live leader and begins an election.
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -422,14 +425,23 @@ func (rf *Raft) startElection() {
 				rf.state = Follower
 				rf.votedFor = -1
 			}
-			if votes * 2 > len(rf.peers) {
+			if rf.state == Candidate && votes * 2 > len(rf.peers) {
 				rf.state = Leader
+				for i := range rf.peers {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0
+				}
+
 				go rf.leaderHeartbeat()
+				go rf.leaderLogEntries()
+				go rf.updateCommitIndex()
 			}
 		}(server)
 	}
 }
 
+// A leader sends periodic heartbeats to all followers
+// through AppendEntries RPC containing no log entry.
 func (rf *Raft) leaderHeartbeat() {
 	for {
 		rf.mu.Lock()
@@ -471,6 +483,120 @@ func (rf *Raft) leaderHeartbeat() {
 	}
 }
 
+// A leader issues AppendEntries RPC to each follower
+// to replicate its log entries.
+func (rf *Raft) leaderLogEntries() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendLogEntries(i)
+	}
+}
+
+func (rf *Raft) sendLogEntries(server int) {
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		// If the leader's last log index >= nextIndex for a follower:
+		// send AppendEntries RPC with log entries starting at nextIndex
+		last := len(rf.log) - 1
+		next := rf.nextIndex[server]
+		if last >= next {
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: next - 1,
+				PrevLogTerm:  rf.log[next-1].Term,
+				Entries:      rf.log[next:],
+				LeaderCommit: rf.commitIndex,
+			}
+			reply := AppendEntriesReply{}
+			rf.mu.Unlock()
+
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if ok {
+				rf.handleAppendEntriesReply(server, &args, &reply)
+			}
+		} else {
+			rf.mu.Unlock()
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		return
+	}
+
+	// If successful: update nextIndex and matchIndex for follower
+	// Otherwise, decrement nextIndex and retry
+	if reply.Success {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+	} else {
+		rf.nextIndex[server] = max(rf.nextIndex[server] - 1, 1)
+	}
+}
+
+// A server periodically checks the latest commit index.
+// If commitIndex > lastApplied, increment lastApplied, and log[lastApplied] to state machine.
+func (rf *Raft) commitLogEntries() {
+	for {
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied {
+			rf.cond.Wait()
+		}
+		rf.lastApplied++
+		index := rf.commitIndex
+		command := rf.log[index].Command
+		rf.mu.Unlock()
+
+		msg := ApplyMsg{CommandValid: true, Command: command, CommandIndex: index}
+		rf.applyCh <- msg
+	}
+}
+
+// The leader updates the commit index if there exists an N such that N > commitIndex,
+// a majority of matchIndex[i] >= N, and log[N].term == currentTerm: set commitIndex = N.
+func (rf *Raft) updateCommitIndex() {
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		majority := 1
+		if rf.commitIndex < len(rf.log) - 1 {
+			n := rf.commitIndex + 1
+			for i := range rf.peers {
+				if i != rf.me && rf.matchIndex[i] >= n {
+					majority++
+				}
+			}
+			if majority * 2 > len(rf.peers) {
+				rf.commitIndex = n
+				rf.cond.Broadcast()
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -500,13 +626,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	rf.state = Follower
 	rf.lastHeartbeat = time.Now()
+	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.commitLogEntries()
 
 	return rf
 }
