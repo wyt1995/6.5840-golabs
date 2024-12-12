@@ -212,9 +212,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// If RPC contains Term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
+		rf.fastForward(args.Term)
 	}
 	// candidate's Term T == currentTerm
 	reply.Term = rf.currentTerm
@@ -231,6 +229,14 @@ func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
 	logIndex := len(rf.log) - 1
 	logTerm  := rf.log[logIndex].Term
 	return (args.LastLogTerm > logTerm) || (args.LastLogTerm == logTerm && args.LastLogIndex >= logIndex)
+}
+
+// set the current term, convert to follower state
+// the caller is responsible for holding the mutex
+func (rf *Raft) fastForward(term int) {
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = -1
 }
 
 // AppendEntries RPC handler
@@ -250,27 +256,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If any RPC contains Term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
+		rf.fastForward(args.Term)
 	}
 	reply.Term = rf.currentTerm
 
 	// If log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm, reply false
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.Success = false
-		reply.LastLogIndex = len(rf.log) - 1
-		reply.LastLogTerm = rf.log[reply.LastLogIndex].Term
-		return
-	} else if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		index := args.PrevLogIndex
-		term  := rf.log[index].Term
-		for index > 0 && rf.log[index-1].Term == term {
-			index--
-		}
-		reply.Success = false
-		reply.LastLogIndex = index
-		reply.LastLogTerm = term
+	if args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		rf.rejectAppendEntries(args, reply)
 		return
 	}
 
@@ -296,6 +288,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
 		rf.cond.Broadcast()
+	}
+}
+
+func (rf *Raft) rejectAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		reply.LastLogIndex = len(rf.log) - 1
+		reply.LastLogTerm = rf.log[reply.LastLogIndex].Term
+	} else {
+		index := args.PrevLogIndex
+		term  := rf.log[index].Term
+		for index > 0 && rf.log[index-1].Term == term {
+			index--
+		}
+		reply.Success = false
+		reply.LastLogIndex = index
+		reply.LastLogTerm = term
 	}
 }
 
@@ -437,23 +446,25 @@ func (rf *Raft) startElection() {
 			if response.VoteGranted {
 				votes++
 			} else if response.Term > rf.currentTerm {
-				rf.currentTerm = response.Term
-				rf.state = Follower
-				rf.votedFor = -1
+				rf.fastForward(response.Term)
 			}
 			if rf.state == Candidate && votes * 2 > len(rf.peers) {
-				rf.state = Leader
-				for i := range rf.peers {
-					rf.nextIndex[i] = len(rf.log)
-					rf.matchIndex[i] = 0
-				}
-
-				go rf.leaderHeartbeat()
-				go rf.leaderLogEntries()
-				go rf.updateCommitIndex()
+				rf.establishLeader()
 			}
 		}(server)
 	}
+}
+
+func (rf *Raft) establishLeader() {
+	rf.state = Leader
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
+
+	go rf.leaderHeartbeat()
+	go rf.leaderLogEntries()
+	go rf.updateCommitIndex()
 }
 
 // A leader sends periodic heartbeats to all followers
@@ -487,9 +498,7 @@ func (rf *Raft) leaderHeartbeat() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					if response.Term > rf.currentTerm {
-						rf.currentTerm = response.Term
-						rf.state = Follower
-						rf.votedFor = -1
+						rf.fastForward(response.Term)
 					}
 				}
 			}(server)
@@ -551,9 +560,7 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 	defer rf.mu.Unlock()
 
 	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.state = Follower
-		rf.votedFor = -1
+		rf.fastForward(reply.Term)
 		return
 	}
 
