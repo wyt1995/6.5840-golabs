@@ -190,8 +190,12 @@ type AppendEntriesArgs struct {
 
 // AppendEntries RPC reply structure.
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	Success      bool
+
+	// Optimization: send inconsistent log entry to reduce rejections
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC handler.
@@ -253,8 +257,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	// If log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm, reply false
-	if args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.LastLogIndex = len(rf.log) - 1
+		reply.LastLogTerm = rf.log[reply.LastLogIndex].Term
+		return
+	} else if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		index := args.PrevLogIndex
+		term  := rf.log[index].Term
+		for index > 0 && rf.log[index-1].Term == term {
+			index--
+		}
+		reply.Success = false
+		reply.LastLogIndex = index
+		reply.LastLogTerm = term
 		return
 	}
 
@@ -542,10 +558,12 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 	}
 
 	// If successful: update nextIndex and matchIndex for follower
-	// Otherwise, decrement nextIndex and retry
+	// Otherwise, decrement nextIndex to bypass all conflicting entries and retry
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
+	} else if reply.LastLogIndex < rf.nextIndex[server] {
+		rf.nextIndex[server] = reply.LastLogIndex
 	} else {
 		rf.nextIndex[server] = max(rf.nextIndex[server] - 1, 1)
 	}
@@ -560,7 +578,7 @@ func (rf *Raft) commitLogEntries() {
 			rf.cond.Wait()
 		}
 		rf.lastApplied++
-		index := rf.commitIndex
+		index := rf.lastApplied
 		command := rf.log[index].Command
 		rf.mu.Unlock()
 
