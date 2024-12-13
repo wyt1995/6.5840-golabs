@@ -438,8 +438,12 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	rf.lastHeartbeat = time.Now()
 
-	idx := len(rf.log) - 1
-	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: idx, LastLogTerm: rf.log[idx].Term}
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
 
 	votes := 0
 	for server := range rf.peers {
