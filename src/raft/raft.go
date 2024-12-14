@@ -207,9 +207,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	// delete log entries up through the last included index
 	rf.log = append(rf.log[:1], rf.log[i+1:]...)
-	if rf.log[0].Term == 0 {
-		rf.log[0].Term = rf.snapshotTerm
-	}
+	rf.log[0].Term = rf.snapshotTerm
 	rf.persist()
 }
 
@@ -314,7 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Reply false if term < currentTerm
+	// Reply false if RPC sender's term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -405,11 +403,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	length := rf.completeLogIndex(len(rf.log) - 1)
 	if args.LastIncludedIndex >= length {
 		rf.log = rf.log[:1]
+		rf.log[0].Term = args.LastIncludedTerm
 		rf.lastApplied = args.LastIncludedIndex
 		rf.commitIndex = args.LastIncludedIndex
 	} else {
 		index := rf.trimmedLogIndex(args.LastIncludedIndex)
 		rf.log = append(rf.log[:1], rf.log[index+1:]...)
+		rf.log[0].Term = args.LastIncludedTerm
 		rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 		rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	}
@@ -745,8 +745,8 @@ func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs
 		return
 	}
 	if args.Done {
-		rf.nextIndex[server] = args.LastIncludedIndex + 1
 		rf.matchIndex[server] = args.LastIncludedIndex
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	}
 }
 
