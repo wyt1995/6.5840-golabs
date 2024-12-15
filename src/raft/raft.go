@@ -421,13 +421,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persist()
 
 	// Send snapshot via applyCh
-	msg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
-		SnapshotTerm:  rf.snapshotTerm,
-		SnapshotIndex: rf.snapshotIndex,
-	}
-	rf.applyCh <- msg
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      rf.snapshot,
+			SnapshotTerm:  rf.snapshotTerm,
+			SnapshotIndex: rf.snapshotIndex,
+		}
+	}()
 }
 
 func (rf *Raft) trimmedLogIndex(index int) int {
@@ -596,6 +597,9 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) establishLeader() {
+	if rf.state == Leader {
+		return
+	}
 	rf.state = Leader
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.completeLogIndex(len(rf.log))
@@ -755,6 +759,10 @@ func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs
 func (rf *Raft) commitLogEntries() {
 	for {
 		rf.mu.Lock()
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
 		for rf.commitIndex <= rf.lastApplied {
 			rf.cond.Wait()
 		}
