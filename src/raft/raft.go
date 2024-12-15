@@ -603,7 +603,7 @@ func (rf *Raft) establishLeader() {
 	rf.state = Leader
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.completeLogIndex(len(rf.log))
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = rf.snapshotIndex
 	}
 
 	go rf.leaderHeartbeat()
@@ -664,6 +664,9 @@ func (rf *Raft) leaderLogEntries() {
 }
 
 func (rf *Raft) sendLogEntries(server int) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		rf.mu.Lock()
 		if rf.killed() || rf.state != Leader {
@@ -671,51 +674,68 @@ func (rf *Raft) sendLogEntries(server int) {
 			return
 		}
 
+		term := rf.currentTerm
+		leader := rf.me
+		commitIndex := rf.commitIndex
+
 		last := rf.completeLogIndex(len(rf.log) - 1)
 		next := rf.nextIndex[server]
 		if next <= rf.snapshotIndex {
 			// If the leader doesn't have the log entries required to bring a follower up to date:
 			// send an InstallSnapshot RPC
-			args := InstallSnapshotArgs{
-				Term:              rf.currentTerm,
-				LeaderId:          rf.me,
-				LastIncludedIndex: rf.snapshotIndex,
-				LastIncludedTerm:  rf.snapshotTerm,
-				Offset:            0,
-				Data:              rf.snapshot,
-				Done:              true,
-			}
-			reply := InstallSnapshotReply{}
+			snapshotIndex := rf.snapshotIndex
+			snapshotTerm  := rf.snapshotTerm
+			snapshot := append([]byte(nil), rf.snapshot...)
 			rf.mu.Unlock()
 
-			ok := rf.sendInstallSnapshot(server, &args, &reply)
-			if ok {
-				rf.handleInstallSnapshotReply(server, &args, &reply)
-			}
+			go func() {
+				args := InstallSnapshotArgs{
+					Term:              term,
+					LeaderId:          leader,
+					LastIncludedIndex: snapshotIndex,
+					LastIncludedTerm:  snapshotTerm,
+					Offset:            0,
+					Data:              snapshot,
+					Done:              true,
+				}
+				reply := InstallSnapshotReply{}
+				ok := rf.sendInstallSnapshot(server, &args, &reply)
+				if ok {
+					rf.handleInstallSnapshotReply(server, &args, &reply)
+				}
+			}()
+
 		} else if last >= next {
 			// If the leader's last log index >= nextIndex for a follower:
 			// send AppendEntries RPC with log entries starting at nextIndex
 			index := rf.trimmedLogIndex(next)
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: next - 1,
-				PrevLogTerm:  rf.log[index-1].Term,
-				Entries:      rf.log[index:],
-				LeaderCommit: rf.commitIndex,
-			}
-			reply := AppendEntriesReply{}
+			prevLogIndex := next - 1
+			prevLogTerm  := rf.log[index-1].Term
+			entries := append([]LogEntry(nil), rf.log[index:]...)
 			rf.mu.Unlock()
 
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			if ok {
-				rf.handleAppendEntriesReply(server, &args, &reply)
-			}
+			go func() {
+				args := AppendEntriesArgs{
+					Term:         term,
+					LeaderId:     leader,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: commitIndex,
+				}
+				reply := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(server, &args, &reply)
+				if ok {
+					rf.handleAppendEntriesReply(server, &args, &reply)
+				}
+			}()
+
 		} else {
+			// Nothing to send, follower is caught up
 			rf.mu.Unlock()
 		}
 
-		time.Sleep(10 * time.Millisecond)
+		<-ticker.C
 	}
 }
 
