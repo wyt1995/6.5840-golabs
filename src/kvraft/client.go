@@ -5,14 +5,18 @@ import "crypto/rand"
 import "math/big"
 
 
+// A client talks to the service through a Clerk with Put/Append/Get methods.
+// The Clerk manages RPC interactions with the servers.
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	leader  int    // clerks send RPCs to the server whose associated Raft is the leader
+	client  int64  // the client invoking the request
+	seqnum  int64  // providing linearizability
 }
 
 func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
+	maximum := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, maximum)
 	x := bigx.Int64()
 	return x
 }
@@ -20,6 +24,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.leader = 0
+	ck.client = nrand()
+	ck.seqnum = 0
 	// You'll have to add code here.
 	return ck
 }
@@ -35,9 +42,19 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
+	ck.seqnum++
+	args := GetArgs{key, ck.client, ck.seqnum}
+	reply := GetReply{}
+	for {
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 
-	// You will have to modify this function.
-	return ""
+		// Retry if the clerk sends an RPC to the wrong leader, or it cannot reach the kvserver
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			continue
+		}
+		return reply.Value
+	}
 }
 
 // shared by Put and Append.
@@ -50,6 +67,17 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.seqnum++
+	args := PutAppendArgs{op, key, value, ck.client, ck.seqnum}
+	reply := PutAppendReply{}
+	for {
+		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			continue
+		}
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
