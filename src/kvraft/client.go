@@ -49,7 +49,7 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 
 		// Retry if the clerk sends an RPC to the wrong leader, or it cannot reach the kvserver
-		if !ok || reply.Err == ErrWrongLeader {
+		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 			ck.leader = (ck.leader + 1) % len(ck.servers)
 			continue
 		}
@@ -71,8 +71,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{op, key, value, ck.client, ck.seqnum}
 	reply := PutAppendReply{}
 	for {
-		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
-		if !ok || reply.Err == ErrWrongLeader {
+		ok := ck.servers[ck.leader].Call("KVServer."+op, &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 			ck.leader = (ck.leader + 1) % len(ck.servers)
 			continue
 		}

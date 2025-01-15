@@ -4,14 +4,15 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 )
 
 type Err string
 
 const (
-	Get    = "Get"
-	Put    = "Put"
-	Append = "Append"
+	GetOp    = "Get"
+	PutOp    = "Put"
+	AppendOp = "Append"
 )
 
 // Put or Append
@@ -27,7 +28,7 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err string
 }
 
 type GetArgs struct {
@@ -38,6 +39,6 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	Err   Err
+	Err   string
 	Value string
 }
