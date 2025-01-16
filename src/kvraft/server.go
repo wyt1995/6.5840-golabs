@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -53,7 +54,7 @@ type KVServer struct {
 	// Your definitions here.
 	kvmap   map[string]string
 	lastSeq map[int64]int64
-	waitChs map[int64]chan RaftReply
+	waitChs map[int]chan RaftReply
 }
 
 // Get RPC handler
@@ -70,12 +71,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	// Enter an Op in the Raft log using rf.Start()
 	op := Op{GetOp, args.Key, "", args.Client, args.SeqNum}
-	_, _, isLeader := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	result := kv.waitChannel(op)
+	result := kv.waitChannel(op, index)
 	reply.Err, reply.Value = result.Err, result.Value
 }
 
@@ -90,12 +91,12 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	op := Op{PutOp, args.Key, args.Value, args.Client, args.SeqNum}
-	_, _, isLeader := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	result := kv.waitChannel(op)
+	result := kv.waitChannel(op, index)
 	reply.Err = result.Err
 }
 
@@ -110,37 +111,38 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	op := Op{AppendOp, args.Key, args.Value, args.Client, args.SeqNum}
-	_, _, isLeader := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	result := kv.waitChannel(op)
+	result := kv.waitChannel(op, index)
 	reply.Err = result.Err
 }
 
 // Wait for reply from the Raft library
-func (kv *KVServer) waitChannel(op Op) RaftReply {
-	ch := make(chan RaftReply)
+func (kv *KVServer) waitChannel(op Op, raftIndex int) RaftReply {
+	ch := make(chan RaftReply, 1)
 	kv.mu.Lock()
-	kv.waitChs[op.Client] = ch
+	kv.waitChs[raftIndex] = ch
 	kv.mu.Unlock()
 
+	var reply RaftReply
 	select {
-	case reply := <-ch:
+	case reply = <-ch:
 		if reply.Client != op.Client || reply.SeqNum != op.SeqNum {
 			reply.Err = ErrWrongLeader
 		}
-		kv.mu.Lock()
-		delete(kv.waitChs, op.Client)
-		kv.mu.Unlock()
-		return reply
-	case <-time.After(time.Millisecond * 100):
-		kv.mu.Lock()
-		delete(kv.waitChs, op.Client)
-		kv.mu.Unlock()
-		return RaftReply{Err: ErrTimeout}
+	case <-time.After(time.Millisecond * 150):
+		reply = RaftReply{Err: ErrTimeout}
 	}
+
+	go func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		delete(kv.waitChs, raftIndex)
+	}()
+	return reply
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -162,6 +164,34 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+// Whenever the key/value server detects that the Raft state size exceeds maxraftstate,
+// it saves a snapshot by calling the Snapshot method of the Raft library.
+func (kv *KVServer) createSnapshot(raftIndex int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.kvmap) != nil || e.Encode(kv.lastSeq) != nil {
+		return
+	}
+	kv.rf.Snapshot(raftIndex, w.Bytes())
+}
+
+func (kv *KVServer) installSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var kvmap map[string]string
+	var lastSeq map[int64]int64
+
+	if d.Decode(&kvmap) != nil || d.Decode(&lastSeq) != nil {
+		return
+	}
+	kv.kvmap = kvmap
+	kv.lastSeq = lastSeq
+}
+
 // A goroutine that keeps reading messages from the applyCh, connected to the Raft library.
 // The server executes Op commands as Raft commits them, i.e. as they appear on the applyCh.
 func (kv *KVServer) applier() {
@@ -170,21 +200,24 @@ func (kv *KVServer) applier() {
 
 		if msg.CommandValid {
 			// apply a commited command to the local state machine
-			op := msg.Command.(Op)  // type assertion
 			kv.mu.Lock()
-			if op.SeqNum <= kv.lastSeq[op.Client] {
+			if msg.CommandIndex <= kv.lastApplied {
 				kv.mu.Unlock()
 				continue
 			}
-			if op.OpType == PutOp {
-				kv.kvmap[op.Key] = op.Value
-			} else if op.OpType == AppendOp {
-				kv.kvmap[op.Key] += op.Value
-			}
-			kv.lastSeq[op.Client] = op.SeqNum
 			kv.lastApplied = msg.CommandIndex
 
-			if ch, ok := kv.waitChs[op.Client]; ok {
+			op := msg.Command.(Op)  // type assertion
+			if op.SeqNum > kv.lastSeq[op.Client] {
+				if op.OpType == PutOp {
+					kv.kvmap[op.Key] = op.Value
+				} else if op.OpType == AppendOp {
+					kv.kvmap[op.Key] += op.Value
+				}
+				kv.lastSeq[op.Client] = op.SeqNum
+			}
+
+			if ch, ok := kv.waitChs[msg.CommandIndex]; ok {
 				reply := RaftReply{OK, "", op.Client, op.SeqNum}
 				if op.OpType == GetOp {
 					reply.Value = kv.kvmap[op.Key]
@@ -222,7 +255,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.kvmap = make(map[string]string)
 	kv.lastSeq = make(map[int64]int64)
-	kv.waitChs = make(map[int64]chan RaftReply)
+	kv.waitChs = make(map[int]chan RaftReply)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)

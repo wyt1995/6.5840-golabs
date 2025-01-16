@@ -211,6 +211,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 }
 
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
