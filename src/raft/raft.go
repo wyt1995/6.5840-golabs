@@ -425,14 +425,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persist()
 
 	// Send snapshot via applyCh
-	go func() {
+	go func(snapshot []byte, term int, index int) {
 		rf.applyCh <- ApplyMsg{
 			SnapshotValid: true,
-			Snapshot:      rf.snapshot,
-			SnapshotTerm:  rf.snapshotTerm,
-			SnapshotIndex: rf.snapshotIndex,
+			Snapshot:      snapshot,
+			SnapshotTerm:  term,
+			SnapshotIndex: index,
 		}
-	}()
+	}(rf.snapshot, rf.snapshotTerm, rf.snapshotIndex)
 }
 
 func (rf *Raft) trimmedLogIndex(index int) int {
