@@ -1,8 +1,11 @@
 package kvraft
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"6.5840/labrpc"
+	"crypto/rand"
+	"math/big"
+	"time"
+)
 
 
 // A client talks to the service through a Clerk with Put/Append/Get methods.
@@ -49,8 +52,9 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 
 		// Retry if the clerk sends an RPC to the wrong leader, or it cannot reach the kvserver
-		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+		if !ok || reply.Err != OK {
 			ck.leader = (ck.leader + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		return reply.Value
@@ -72,8 +76,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	reply := PutAppendReply{}
 	for {
 		ok := ck.servers[ck.leader].Call("KVServer."+op, &args, &reply)
-		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+		if !ok || reply.Err != OK {
 			ck.leader = (ck.leader + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		return

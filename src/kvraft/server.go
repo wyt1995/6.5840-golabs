@@ -221,7 +221,12 @@ func (kv *KVServer) applier() {
 			if ch, ok := kv.waitChs[msg.CommandIndex]; ok {
 				reply := RaftReply{OK, "", op.Client, op.SeqNum}
 				if op.OpType == GetOp {
-					reply.Value = kv.kvmap[op.Key]
+					value, ok := kv.kvmap[op.Key]
+					if ok {
+						reply.Value = value
+					} else {
+						reply.Err = ErrNoKey
+					}
 				}
 				ch <- reply
 			}
