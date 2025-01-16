@@ -137,11 +137,12 @@ func (kv *KVServer) waitChannel(op Op, raftIndex int) RaftReply {
 		reply = RaftReply{Err: ErrTimeout}
 	}
 
-	go func() {
+	go func(index int) {
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		delete(kv.waitChs, raftIndex)
-	}()
+		delete(kv.waitChs, index)
+	}(raftIndex)
+
 	return reply
 }
 
@@ -175,7 +176,7 @@ func (kv *KVServer) createSnapshot(raftIndex int) {
 	kv.rf.Snapshot(raftIndex, w.Bytes())
 }
 
-func (kv *KVServer) installSnapshot(snapshot []byte) {
+func (kv *KVServer) applySnapshot(snapshot []byte) {
 	if snapshot == nil || len(snapshot) == 0 {
 		return
 	}
@@ -224,9 +225,19 @@ func (kv *KVServer) applier() {
 				}
 				ch <- reply
 			}
+
+			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
+				kv.createSnapshot(msg.CommandIndex)
+			}
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
-			// 4B: install a snapshot
+			// apply an installed snapshot to the local state machine
+			kv.mu.Lock()
+			if msg.SnapshotIndex > kv.lastApplied {
+				kv.applySnapshot(msg.Snapshot)
+				kv.lastApplied = msg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
 	}
 }
@@ -261,6 +272,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.applySnapshot(persister.ReadSnapshot())
 	go kv.applier()
 
 	return kv
