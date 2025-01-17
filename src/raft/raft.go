@@ -360,8 +360,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
+		prev := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, rf.completeLogIndex(len(rf.log)-1))
-		rf.cond.Broadcast()
+		if rf.commitIndex > prev {
+			rf.cond.Broadcast()
+		}
 	}
 }
 
@@ -588,6 +591,10 @@ func (rf *Raft) startElection() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
+			// avoid term confusion
+			if args.Term != rf.currentTerm {
+				return
+			}
 			if response.VoteGranted {
 				votes++
 			} else if response.Term > rf.currentTerm {
@@ -639,17 +646,20 @@ func (rf *Raft) leaderHeartbeat() {
 			if server == rf.me {
 				continue
 			}
-			go func(server int) {
+			go func(server int, term int) {
 				response := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(server, &args, &response)
 				if ok {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
+					if term != rf.currentTerm {
+						return
+					}
 					if response.Term > rf.currentTerm {
 						rf.fastForward(response.Term)
 					}
 				}
-			}(server)
+			}(server, rf.currentTerm)
 		}
 
 		time.Sleep(heartbeat * time.Millisecond)
@@ -747,6 +757,9 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if args.Term != rf.currentTerm {
+		return
+	}
 	if reply.Term > rf.currentTerm {
 		rf.fastForward(reply.Term)
 		return
@@ -768,6 +781,9 @@ func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if args.Term != rf.currentTerm {
+		return
+	}
 	if reply.Term > rf.currentTerm {
 		rf.fastForward(reply.Term)
 		return
@@ -779,7 +795,7 @@ func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs
 }
 
 // A server periodically checks the latest commit index.
-// If commitIndex > lastApplied, increment lastApplied, and log[lastApplied] to state machine.
+// If commitIndex > lastApplied, increment lastApplied, and apply log[lastApplied] to state machine.
 func (rf *Raft) commitLogEntries() {
 	for {
 		rf.mu.Lock()
@@ -810,18 +826,20 @@ func (rf *Raft) updateCommitIndex() {
 			return
 		}
 
-		majority := 1
-		if rf.commitIndex < rf.completeLogIndex(len(rf.log) - 1) {
-			n := rf.commitIndex + 1
+		n := rf.completeLogIndex(len(rf.log) - 1)
+		for n > rf.commitIndex {
+			majority := 1
 			for i := range rf.peers {
 				if i != rf.me && rf.matchIndex[i] >= n {
 					majority++
 				}
 			}
-			if majority * 2 > len(rf.peers) {
+			if majority * 2 > len(rf.peers) && rf.log[rf.trimmedLogIndex(n)].Term == rf.currentTerm {
 				rf.commitIndex = n
 				rf.cond.Broadcast()
+				break
 			}
+			n--
 		}
 		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
