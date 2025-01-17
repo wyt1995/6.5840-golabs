@@ -206,7 +206,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshotTerm = rf.log[i].Term
 
 	// delete log entries up through the last included index
-	rf.log = append(rf.log[:1], rf.log[i+1:]...)
+	if i + 1 >= len(rf.log) {
+		rf.log = rf.log[:1]
+	} else {
+		rf.log = append(rf.log[:1], rf.log[i+1:]...)
+	}
 	rf.log[0].Term = rf.snapshotTerm
 	rf.persist()
 }
@@ -617,17 +621,17 @@ func (rf *Raft) establishLeader() {
 		rf.matchIndex[i] = rf.snapshotIndex
 	}
 
-	go rf.leaderHeartbeat()
-	go rf.leaderLogEntries()
-	go rf.updateCommitIndex()
+	go rf.leaderHeartbeat(rf.currentTerm)
+	go rf.leaderLogEntries(rf.currentTerm)
+	go rf.updateCommitIndex(rf.currentTerm)
 }
 
 // A leader sends periodic heartbeats to all followers
 // through AppendEntries RPC containing no log entry.
-func (rf *Raft) leaderHeartbeat() {
+func (rf *Raft) leaderHeartbeat(term int) {
 	for {
 		rf.mu.Lock()
-		if rf.killed() || rf.state != Leader {
+		if rf.killed() || rf.state != Leader || rf.currentTerm != term {
 			rf.mu.Unlock()
 			return
 		}
@@ -668,27 +672,26 @@ func (rf *Raft) leaderHeartbeat() {
 
 // A leader issues AppendEntries RPC to each follower
 // to replicate its log entries.
-func (rf *Raft) leaderLogEntries() {
+func (rf *Raft) leaderLogEntries(term int) {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendLogEntries(i)
+		go rf.sendLogEntries(term, i)
 	}
 }
 
-func (rf *Raft) sendLogEntries(server int) {
-	ticker := time.NewTicker(10 * time.Millisecond)
+func (rf *Raft) sendLogEntries(term int, server int) {
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		rf.mu.Lock()
-		if rf.killed() || rf.state != Leader {
+		if rf.killed() || rf.state != Leader || rf.currentTerm != term {
 			rf.mu.Unlock()
 			return
 		}
 
-		term := rf.currentTerm
 		leader := rf.me
 		commitIndex := rf.commitIndex
 
@@ -768,7 +771,7 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 	// If successful: update nextIndex and matchIndex for follower
 	// Otherwise, decrement nextIndex to bypass all conflicting entries and retry
 	if reply.Success {
-		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.matchIndex[server] = max(args.PrevLogIndex + len(args.Entries), rf.matchIndex[server])
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else if reply.LastLogIndex < rf.nextIndex[server] {
 		rf.nextIndex[server] = max(reply.LastLogIndex, 1)
@@ -788,7 +791,7 @@ func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs
 		rf.fastForward(reply.Term)
 		return
 	}
-	if args.Done {
+	if args.LastIncludedIndex >= rf.matchIndex[server] {
 		rf.matchIndex[server] = args.LastIncludedIndex
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	}
@@ -818,10 +821,10 @@ func (rf *Raft) commitLogEntries() {
 
 // The leader updates the commit index if there exists an N such that N > commitIndex,
 // a majority of matchIndex[i] >= N, and log[N].term == currentTerm: set commitIndex = N.
-func (rf *Raft) updateCommitIndex() {
+func (rf *Raft) updateCommitIndex(term int) {
 	for {
 		rf.mu.Lock()
-		if rf.killed() || rf.state != Leader {
+		if rf.killed() || rf.state != Leader || rf.currentTerm != term {
 			rf.mu.Unlock()
 			return
 		}
