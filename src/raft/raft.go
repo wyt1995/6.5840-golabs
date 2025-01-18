@@ -338,7 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm, reply false
 	index := rf.trimmedLogIndex(args.PrevLogIndex)
-	if index >= len(rf.log) || args.PrevLogTerm != rf.log[index].Term {
+	if args.PrevLogIndex < rf.snapshotIndex || index >= len(rf.log) || args.PrevLogTerm != rf.log[index].Term {
 		rf.rejectAppendEntries(args, reply)
 		return
 	}
@@ -374,7 +374,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) rejectAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	last := rf.completeLogIndex(len(rf.log) - 1)
-	if args.PrevLogIndex > last {
+	if args.PrevLogIndex < rf.snapshotIndex {
+		reply.Success = false
+		reply.LastLogIndex = rf.snapshotIndex
+		reply.LastLogTerm = rf.snapshotTerm
+	} else if args.PrevLogIndex > last {
 		reply.Success = false
 		reply.LastLogIndex = last
 		reply.LastLogTerm = rf.log[len(rf.log)-1].Term
@@ -682,8 +686,12 @@ func (rf *Raft) leaderLogEntries(term int) {
 }
 
 func (rf *Raft) sendLogEntries(term int, server int) {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	snapTicker := time.NewTicker(100 * time.Millisecond)
+	defer func() {
+		ticker.Stop()
+		snapTicker.Stop()
+	}()
 
 	for {
 		rf.mu.Lock()
@@ -721,6 +729,7 @@ func (rf *Raft) sendLogEntries(term int, server int) {
 					rf.handleInstallSnapshotReply(server, &args, &reply)
 				}
 			}()
+			<-snapTicker.C
 
 		} else if last >= next {
 			// If the leader's last log index >= nextIndex for a follower:
@@ -746,13 +755,13 @@ func (rf *Raft) sendLogEntries(term int, server int) {
 					rf.handleAppendEntriesReply(server, &args, &reply)
 				}
 			}()
+			<-ticker.C
 
 		} else {
 			// Nothing to send, follower is caught up
 			rf.mu.Unlock()
+			<-ticker.C
 		}
-
-		<-ticker.C
 	}
 }
 
