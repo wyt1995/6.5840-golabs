@@ -1,26 +1,49 @@
 package shardctrler
 
+import (
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+	"sync"
+)
 
-import "6.5840/raft"
-import "6.5840/labrpc"
-import "sync"
-import "6.5840/labgob"
 
-
+// The shard controller is implemented as a fault-tolerant service using Raft.
 type ShardCtrler struct {
 	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
-	// Your data here.
-
 	configs []Config // indexed by config num
+
+	// Your data here.
+	lastSeq map[int64]int64
+	waitChs map[int64]chan OpReply
 }
 
 
+// The ShardCtrler submits any Join/Leave/Move/Query operation to Raft.
+// Op and OpReply are used for communication via the applyCh.
 type Op struct {
 	// Your data here.
+	OpType  string
+	Client  int64
+	SeqNum  int64
+
+	// arguments sent by the client
+	Servers map[int][]string // Join
+	GIDs    []int            // Leave
+	Shard   int              // Move
+	GID     int              // Move
+	Num     int              // Query
+}
+
+type OpReply struct {
+	Err    Err
+	Config Config // for Query RPC
+	Client int64
+	SeqNum int64
 }
 
 
