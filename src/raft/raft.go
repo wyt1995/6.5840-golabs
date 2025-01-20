@@ -667,7 +667,7 @@ func (rf *Raft) leaderHeartbeat(term int) {
 						rf.fastForward(response.Term)
 					}
 				}
-			}(server, rf.currentTerm)
+			}(server, args.Term)
 		}
 
 		time.Sleep(heartbeat * time.Millisecond)
