@@ -13,6 +13,15 @@ const (
 	GetOp    = "Get"
 	PutOp    = "Put"
 	AppendOp = "Append"
+	Update   = "Update"
+	Join     = "Join"
+	Leave    = "Leave"
+)
+
+const (
+	Serving = iota
+	Waiting
+	Leaving
 )
 
 const (
@@ -48,4 +57,14 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type MoveArgs struct {
+	Shard     Shard
+	ShardID   int
+	LastSeq   map[int64]int64
+}
+
+type MoveReply struct {
+	Err Err
 }

@@ -11,8 +11,9 @@ import (
 )
 
 type Shard struct {
-	kvmap     map[string]string
-	confignum int
+	KVmap     map[string]string
+	ConfigNum int
+	Status    int
 }
 
 type Op struct {
@@ -24,6 +25,14 @@ type Op struct {
 	Value  string
 	Client int64
 	SeqNum int64
+
+	// For configuration updates
+	Config shardctrler.Config
+
+	// For shard migration
+	Shard   Shard
+	ShardID int
+	LastSeq map[int64]int64
 }
 
 type OpReply struct {
@@ -81,7 +90,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	result := kv.waitChannel(op, index)
 	reply.Err = result.Err
-	reply.Value = kv.shards[si].kvmap[op.Key]
+	if value, ok := kv.shards[si].KVmap[op.Key]; ok {
+		reply.Value = value
+	} else {
+		reply.Err = ErrNoKey
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -101,6 +114,30 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	op := Op{OpType: args.Op, Key: args.Key, Value: args.Value, Client: args.Client, SeqNum: args.SeqNum}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	result := kv.waitChannel(op, index)
+	reply.Err = result.Err
+}
+
+func (kv *ShardKV) MoveShard(args *MoveArgs, reply *MoveReply) {
+	kv.mu.Lock()
+	if kv.currConfig.Num != args.Shard.ConfigNum || kv.shards[args.ShardID].Status != Waiting {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		OpType:  Join,
+		Shard:   args.Shard,
+		ShardID: args.ShardID,
+		LastSeq: args.LastSeq,
+	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -153,6 +190,17 @@ func (kv *ShardKV) applier() {
 			switch op.OpType {
 			case GetOp, PutOp, AppendOp:
 				kv.doClientRequest(&op, &reply)
+			case Update:
+				kv.doConfigUpdate(&op)
+			case Join:
+				kv.doShardJoin(&op)
+			case Leave:
+				kv.doShardLeave(&op)
+			}
+
+			// snapshot
+			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
+
 			}
 
 			if ch, ok := kv.waitChs[msg.CommandIndex]; ok {
@@ -165,33 +213,156 @@ func (kv *ShardKV) applier() {
 
 func (kv *ShardKV) doClientRequest(op *Op, reply *OpReply) {
 	si := key2shard(op.Key)
-	if kv.currConfig.Shards[si] != kv.gid {
+	if kv.currConfig.Shards[si] != kv.gid || kv.shards[si].Status != Serving {
 		reply.Err = ErrWrongGroup
 		return
 	}
 	if op.SeqNum > kv.lastSeq[op.Client] {
 		if op.OpType == PutOp {
-			kv.shards[si].kvmap[op.Key] = op.Value
+			kv.shards[si].KVmap[op.Key] = op.Value
 		} else if op.OpType == AppendOp {
-			kv.shards[si].kvmap[op.Key] += op.Value
+			kv.shards[si].KVmap[op.Key] += op.Value
 		}
 		kv.lastSeq[op.Client] = op.SeqNum
 	}
 }
 
+// Update the latest configuration by setting shard Status; not responsible data migration.
+// If we lose a shard, stop serving requests to keys in that shard immediately.
+// If we gain a shard, wait for the previous owner to send over the old shard data.
+func (kv *ShardKV) doConfigUpdate(op *Op) {
+	oldConfig := kv.currConfig
+	newConfig := op.Config
+	if newConfig.Num < oldConfig.Num {
+		return
+	}
+	for si, oldgid := range oldConfig.Shards {
+		newgid := newConfig.Shards[si]
+		if oldgid == newgid {
+			continue
+		}
+		if newgid == kv.gid {
+			// gain a shard
+			if oldgid == 0 {
+				kv.shards[si].Status = Serving
+			} else {
+				kv.shards[si].Status = Waiting
+			}
+		} else if oldgid == kv.gid {
+			// shard moves to another replica group
+			kv.shards[si].Status = Leaving
+		}
+	}
+	kv.prevConfig = oldConfig
+	kv.currConfig = newConfig
+}
+
+func (kv *ShardKV) doShardJoin(op *Op) {
+	if op.Shard.ConfigNum < kv.currConfig.Num {
+		return
+	}
+	si := op.ShardID
+	kv.shards[si].ConfigNum = op.Shard.ConfigNum
+	kv.shards[si].KVmap = copyMap(op.Shard.KVmap)
+	for client, seqnum := range op.LastSeq {
+		if seq, ok := kv.lastSeq[client]; !ok || seq < seqnum {
+			kv.lastSeq[client] = seqnum
+		}
+	}
+	kv.shards[si].Status = Serving
+}
+
+func (kv *ShardKV) doShardLeave(op *Op) {
+	if op.Shard.ConfigNum < kv.currConfig.Num {
+		return
+	}
+	si := op.ShardID
+	kv.shards[si].KVmap = make(map[string]string)
+	kv.shards[si].ConfigNum = op.Shard.ConfigNum
+	kv.shards[si].Status = Leaving
+}
+
 
 func (kv *ShardKV) updateConfig() {
 	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
 		kv.mu.Lock()
-		kv.currConfig = kv.shardClerk.Query(-1)
-		for si, gid := range kv.currConfig.Shards {
-			if gid == kv.gid {
-				kv.shards[si].confignum = kv.currConfig.Num
+		if !kv.isUpdated() {
+			kv.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		configNum := kv.currConfig.Num
+		kv.mu.Unlock()
+
+		// ask the shard controller for the latest configuration
+		newConfig := kv.shardClerk.Query(configNum + 1)
+		if newConfig.Num != configNum + 1 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// detected a new configuration; send to Raft for replication
+		op := Op{OpType: Update, Config: newConfig, Client: int64(kv.gid), SeqNum: int64(newConfig.Num)}
+		index, _, isLeader := kv.rf.Start(op)
+		if isLeader {
+			result := kv.waitChannel(op, index)
+			if result.Err == OK {
+				kv.migrateShards()
 			}
 		}
-		kv.mu.Unlock()
+
+		// poll the shard controller every 100 ms
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// Start the shard migration process when a new configuration is detected.
+func (kv *ShardKV) migrateShards() {
+	kv.mu.Lock()
+	shardsToMove := make([]int, 0)
+	for si, shard := range kv.shards {
+		if shard.Status == Leaving {
+			shardsToMove = append(shardsToMove, si)
+		}
+	}
+	lastSeq := copyMap(kv.lastSeq)
+	kv.mu.Unlock()
+
+	for _, si := range shardsToMove {
+		kv.mu.Lock()
+		data := Shard{KVmap: copyMap(kv.shards[si].KVmap), ConfigNum: kv.currConfig.Num}
+		gid := kv.currConfig.Shards[si]
+		servers := kv.currConfig.Groups[gid]
+		kv.mu.Unlock()
+
+		args := MoveArgs{Shard: data, ShardID: si, LastSeq: lastSeq}
+		go kv.sendShard(&args, servers)
+	}
+}
+
+func (kv *ShardKV) sendShard(args *MoveArgs, group []string) {
+	for _, srv := range group {
+		dest := kv.make_end(srv)
+		reply := &MoveReply{}
+		ok := dest.Call("ShardKV.MoveShard", args, reply)
+		if ok && reply.Err == OK {
+			break
+		}
+	}
+}
+
+func (kv *ShardKV) isUpdated() bool {
+	for si, shard := range kv.shards {
+		if kv.currConfig.Shards[si] == kv.gid && shard.Status != Serving {
+			return false
+		}
+	}
+	return true
 }
 
 
@@ -236,7 +407,8 @@ func (kv *ShardKV) killed() bool {
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
-func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int,
+	gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -251,7 +423,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 	kv.shards = make([]*Shard, shardctrler.NShards)
 	for i := 0; i < shardctrler.NShards; i++ {
-		kv.shards[i] = &Shard{kvmap: make(map[string]string), confignum: 0}
+		kv.shards[i] = &Shard{KVmap: make(map[string]string), ConfigNum: 0}
 	}
 
 	// Use something like this to talk to the shardctrler:
