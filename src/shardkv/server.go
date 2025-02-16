@@ -245,10 +245,12 @@ func (kv *ShardKV) doClientRequest(op *Op, reply *OpReply) {
 func (kv *ShardKV) doConfigUpdate(op *Op) {
 	oldConfig := kv.currConfig
 	newConfig := op.Config
-	if newConfig.Num < oldConfig.Num {
+	if newConfig.Num <= oldConfig.Num {
 		return
 	}
-	for si, oldgid := range oldConfig.Shards {
+	for si := range kv.shards {
+		kv.shards[si].ConfigNum = newConfig.Num
+		oldgid := oldConfig.Shards[si]
 		newgid := newConfig.Shards[si]
 		if oldgid == newgid {
 			continue
@@ -271,7 +273,7 @@ func (kv *ShardKV) doConfigUpdate(op *Op) {
 
 func (kv *ShardKV) doShardJoin(op *Op) {
 	si := op.ShardID
-	if op.Shard.ConfigNum < kv.shards[si].ConfigNum {
+	if op.Shard.ConfigNum < kv.shards[si].ConfigNum || op.Shard.ConfigNum < kv.currConfig.Num {
 		return
 	}
 	kv.shards[si].ConfigNum = op.Shard.ConfigNum
@@ -290,7 +292,6 @@ func (kv *ShardKV) doShardLeave(op *Op) {
 		return
 	}
 	kv.shards[si].KVmap = make(map[string]string)
-	kv.shards[si].ConfigNum = op.Shard.ConfigNum
 	kv.shards[si].Status = Removed
 }
 
@@ -302,12 +303,16 @@ func (kv *ShardKV) updateConfig() {
 			continue
 		}
 
-		kv.mu.Lock()
+		// check shard migration status before polling
+		if !kv.isReady() {
+			kv.migrateShards()
+		}
 		if !kv.isUpdated() {
-			kv.mu.Unlock()
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+
+		kv.mu.Lock()
 		configNum := kv.currConfig.Num
 		kv.mu.Unlock()
 
@@ -319,7 +324,7 @@ func (kv *ShardKV) updateConfig() {
 		}
 
 		// detected a new configuration; send to Raft for replication
-		op := Op{OpType: Update, Config: newConfig, Client: int64(kv.gid), SeqNum: int64(newConfig.Num)}
+		op := Op{OpType: Update, Config: newConfig}
 		index, _, isLeader := kv.rf.Start(op)
 		if isLeader {
 			result := kv.waitChannel(op, index)
@@ -337,8 +342,8 @@ func (kv *ShardKV) updateConfig() {
 func (kv *ShardKV) migrateShards() {
 	kv.mu.Lock()
 	shardsToMove := make([]int, 0)
-	for si, shard := range kv.shards {
-		if shard.Status == Leaving && kv.prevConfig.Shards[si] == kv.gid {
+	for si := range kv.shards {
+		if kv.shards[si].Status == Leaving && kv.prevConfig.Shards[si] == kv.gid {
 			shardsToMove = append(shardsToMove, si)
 		}
 	}
@@ -373,16 +378,30 @@ func (kv *ShardKV) sendShard(args *MoveArgs, group []string) {
 }
 
 func (kv *ShardKV) removeShard(shardID int, configNum int) {
-	op := Op{OpType: Leave, ShardID: shardID, Shard: Shard{ConfigNum: configNum}}
+	op := Op{OpType: Leave, ShardID: shardID}
 	index, _, isLeader := kv.rf.Start(op)
 	if isLeader {
 		kv.waitChannel(op, index)
 	}
 }
 
+func (kv *ShardKV) isReady() bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	for si, oldgid := range kv.prevConfig.Shards {
+		if oldgid == kv.gid && kv.shards[si].Status == Leaving {
+			return false
+		}
+	}
+	return true
+}
+
 func (kv *ShardKV) isUpdated() bool {
-	for si, shard := range kv.shards {
-		if kv.currConfig.Shards[si] == kv.gid && shard.Status != Serving {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	for si, oldgid := range kv.prevConfig.Shards {
+		newgid := kv.currConfig.Shards[si]
+		if oldgid != kv.gid && newgid == kv.gid && kv.shards[si].Status == Waiting {
 			return false
 		}
 	}
