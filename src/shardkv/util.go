@@ -10,9 +10,9 @@ func DPrintf(format string, a ...interface{}) {
 	}
 }
 
-func copyMap[K comparable, V any](original map[K]V) map[K]V {
+func copyMap[K comparable, V any](src map[K]V) map[K]V {
 	newMap := make(map[K]V)
-	for k, v := range original {
+	for k, v := range src {
 		newMap[k] = v
 	}
 	return newMap

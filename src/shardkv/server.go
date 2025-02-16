@@ -5,6 +5,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"6.5840/shardctrler"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +61,7 @@ type ShardKV struct {
 	prevConfig   shardctrler.Config
 	currConfig   shardctrler.Config
 
-	shards       []*Shard
+	shards       []Shard
 	lastSeq      map[int64]int64
 	waitChs      map[int]chan OpReply
 }
@@ -70,12 +71,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	si := key2shard(args.Key)
 	kv.mu.Lock()
-	if kv.currConfig.Shards[si] != kv.gid {
+	if kv.currConfig.Shards[si] != kv.gid || kv.shards[si].Status != Serving {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
 	}
 	if args.SeqNum <= kv.lastSeq[args.Client] {
+		reply.Value = kv.shards[si].KVmap[args.Key]
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -90,6 +92,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	result := kv.waitChannel(op, index)
 	reply.Err = result.Err
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	if value, ok := kv.shards[si].KVmap[op.Key]; ok {
 		reply.Value = value
 	} else {
@@ -101,7 +106,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	si := key2shard(args.Key)
 	kv.mu.Lock()
-	if kv.currConfig.Shards[si] != kv.gid {
+	if kv.currConfig.Shards[si] != kv.gid || kv.shards[si].Status != Serving {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -125,7 +130,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *ShardKV) MoveShard(args *MoveArgs, reply *MoveReply) {
 	kv.mu.Lock()
-	if kv.currConfig.Num != args.Shard.ConfigNum || kv.shards[args.ShardID].Status != Waiting {
+	if kv.shards[args.ShardID].ConfigNum != args.Shard.ConfigNum || kv.shards[args.ShardID].Status != Waiting {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongGroup
 		return
@@ -198,13 +203,20 @@ func (kv *ShardKV) applier() {
 				kv.doShardLeave(&op)
 			}
 
-			// snapshot
+			// save a snapshot if the local state size exceeds maxraftstate
 			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
-
+				kv.createSnapshot(msg.CommandIndex)
 			}
 
 			if ch, ok := kv.waitChs[msg.CommandIndex]; ok {
 				ch <- reply
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if msg.SnapshotIndex > kv.lastApplied {
+				kv.applySnapshot(msg.Snapshot)
+				kv.lastApplied = msg.SnapshotIndex
 			}
 			kv.mu.Unlock()
 		}
@@ -258,10 +270,10 @@ func (kv *ShardKV) doConfigUpdate(op *Op) {
 }
 
 func (kv *ShardKV) doShardJoin(op *Op) {
-	if op.Shard.ConfigNum < kv.currConfig.Num {
+	si := op.ShardID
+	if op.Shard.ConfigNum < kv.shards[si].ConfigNum {
 		return
 	}
-	si := op.ShardID
 	kv.shards[si].ConfigNum = op.Shard.ConfigNum
 	kv.shards[si].KVmap = copyMap(op.Shard.KVmap)
 	for client, seqnum := range op.LastSeq {
@@ -273,13 +285,13 @@ func (kv *ShardKV) doShardJoin(op *Op) {
 }
 
 func (kv *ShardKV) doShardLeave(op *Op) {
-	if op.Shard.ConfigNum < kv.currConfig.Num {
+	si := op.ShardID
+	if kv.shards[si].Status != Leaving {
 		return
 	}
-	si := op.ShardID
 	kv.shards[si].KVmap = make(map[string]string)
 	kv.shards[si].ConfigNum = op.Shard.ConfigNum
-	kv.shards[si].Status = Leaving
+	kv.shards[si].Status = Removed
 }
 
 
@@ -326,7 +338,7 @@ func (kv *ShardKV) migrateShards() {
 	kv.mu.Lock()
 	shardsToMove := make([]int, 0)
 	for si, shard := range kv.shards {
-		if shard.Status == Leaving {
+		if shard.Status == Leaving && kv.prevConfig.Shards[si] == kv.gid {
 			shardsToMove = append(shardsToMove, si)
 		}
 	}
@@ -335,7 +347,7 @@ func (kv *ShardKV) migrateShards() {
 
 	for _, si := range shardsToMove {
 		kv.mu.Lock()
-		data := Shard{KVmap: copyMap(kv.shards[si].KVmap), ConfigNum: kv.currConfig.Num}
+		data := Shard{KVmap: copyMap(kv.shards[si].KVmap), ConfigNum: kv.shards[si].ConfigNum}
 		gid := kv.currConfig.Shards[si]
 		servers := kv.currConfig.Groups[gid]
 		kv.mu.Unlock()
@@ -346,13 +358,25 @@ func (kv *ShardKV) migrateShards() {
 }
 
 func (kv *ShardKV) sendShard(args *MoveArgs, group []string) {
-	for _, srv := range group {
-		dest := kv.make_end(srv)
-		reply := &MoveReply{}
-		ok := dest.Call("ShardKV.MoveShard", args, reply)
-		if ok && reply.Err == OK {
-			break
+	for !kv.killed() {
+		for _, srv := range group {
+			dest := kv.make_end(srv)
+			reply := &MoveReply{}
+			ok := dest.Call("ShardKV.MoveShard", args, reply)
+			if ok && reply.Err == OK {
+				go kv.removeShard(args.ShardID, args.Shard.ConfigNum)
+				return
+			}
 		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) removeShard(shardID int, configNum int) {
+	op := Op{OpType: Leave, ShardID: shardID, Shard: Shard{ConfigNum: configNum}}
+	index, _, isLeader := kv.rf.Start(op)
+	if isLeader {
+		kv.waitChannel(op, index)
 	}
 }
 
@@ -363,6 +387,43 @@ func (kv *ShardKV) isUpdated() bool {
 		}
 	}
 	return true
+}
+
+
+func (kv *ShardKV) createSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.shards) != nil || e.Encode(kv.lastSeq) != nil {
+		return
+	}
+	if e.Encode(kv.prevConfig) != nil || e.Encode(kv.currConfig) != nil {
+		return
+	}
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *ShardKV) applySnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var shards []Shard
+	var lastSeq map[int64]int64
+	var prevConfig shardctrler.Config
+	var currConfig shardctrler.Config
+
+	if d.Decode(&shards) != nil || d.Decode(&lastSeq) != nil {
+		return
+	}
+	if d.Decode(&prevConfig) != nil || d.Decode(&currConfig) != nil {
+		return
+	}
+	kv.shards = shards
+	kv.lastSeq = lastSeq
+	kv.prevConfig = prevConfig
+	kv.currConfig = currConfig
 }
 
 
@@ -421,9 +482,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
-	kv.shards = make([]*Shard, shardctrler.NShards)
+	kv.shards = make([]Shard, shardctrler.NShards)
 	for i := 0; i < shardctrler.NShards; i++ {
-		kv.shards[i] = &Shard{KVmap: make(map[string]string), ConfigNum: 0}
+		kv.shards[i] = Shard{KVmap: make(map[string]string), ConfigNum: 0}
 	}
 
 	// Use something like this to talk to the shardctrler:
@@ -433,6 +494,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.applySnapshot(persister.ReadSnapshot())
 
 	go kv.applier()
 	go kv.updateConfig()

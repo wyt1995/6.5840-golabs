@@ -22,6 +22,7 @@ const (
 	Serving = iota
 	Waiting
 	Leaving
+	Removed
 )
 
 const (
